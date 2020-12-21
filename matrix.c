@@ -2,13 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <sys/random.h>
+#include <float.h>
+#include <omp.h>
 #include "matrix.h"
 
-extern inline int m_index(const matrix *M, const int i, const int j) {
+inline int m_index(const matrix *M, const int i, const int j) {
     return j*(M->rows) + i;
 }
 
-extern inline matrix* init_matrix(const int rows, const int cols) {
+inline matrix* init_matrix(const int rows, const int cols) {
     matrix *M = (matrix *) calloc(1, sizeof(matrix));
     //printf("init %i %i\n", rows, cols);
     M->rows = rows;
@@ -17,12 +20,13 @@ extern inline matrix* init_matrix(const int rows, const int cols) {
     return M;
 }
 
-extern inline matrix* copy_matrix(const matrix *M) {
+inline matrix* copy_matrix(const matrix *M) {
     if (M == NULL) {
         return NULL;
     }
 
     matrix *M_copy = init_matrix(M->rows, M->cols);
+    #pragma omp parallel for
     for (int j = 0; j < M->cols; j++) {
         for (int i = 0; i < M->rows; i++) {
             M_copy->data[m_index(M_copy, i, j)] = M->data[m_index(M, i, j)];
@@ -33,7 +37,7 @@ extern inline matrix* copy_matrix(const matrix *M) {
     return M_copy;
 }
 
-extern inline void free_matrix(matrix *M) {
+inline void free_matrix(matrix *M) {
     if (M != NULL) {
         free(M->data);
         free(M);
@@ -44,19 +48,10 @@ matrix* mult(const matrix* restrict A, const matrix* restrict B) {
     if (A->cols != B->rows) {
         return NULL;
     }
-    matrix* prod = init_matrix(A->rows, B->cols);
-    for (int i = 0; i < prod->rows; i++) {
-        for (int j = 0; j < prod->cols; j++) {
-            double acc = 0.0;
-            for (int k = 0; k < A->cols; k++) {
-                
-                acc += B->data[m_index(B, k, j)]*A->data[m_index(A, i, k)];
-            }
-            prod->data[m_index(prod, i, j)] = acc;
-        }
-    }
+    matrix* C = init_matrix(A->rows, B->cols);
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, A->rows, B->cols, A->cols, 1.0, A->data, A->rows, B->data, B->rows, 0.0, C->data, A->rows);
 
-    return prod;
+    return C;
 }
 
 void print_matrix(const matrix *M) {
@@ -78,47 +73,6 @@ void print_matrix(const matrix *M) {
     printf("]\n\n");
 }
 
-extern inline int sign(const double d) {
-    return d > 0.0 ? 1 : (d < 0.0 ? -1 : 0);
-}
-
-void scalar_mult(const double c, matrix *M) {
-    for (int j = 0; j < M->cols; j++) {
-        for (int i = 0; i < M->rows; i++) {
-            M->data[m_index(M, i, j)] *= c;
-        }
-    }
-}
-
-int add(matrix *A, const matrix *B) {
-    if (A->rows != B->rows || A->cols != B-> cols) {
-        return -1;
-    }
-
-    for (int j = 0; j < A->cols; j++) {
-        for (int i = 0; i < A->rows; i++) {
-            int index = m_index(A, i, j);
-            A->data[index] += B->data[index];
-        }
-    }
-
-    return 0;
-}
-
-int sub(matrix *A, const matrix *B) {
-    if (A->rows != B->rows || A->cols != B-> cols) {
-        return -1;
-    }
-
-    for (int j = 0; j < A->cols; j++) {
-        for (int i = 0; i < A->rows; i++) {
-            int index = m_index(A, i, j);
-            A->data[index] -= B->data[index];
-        }
-    }
-
-    return 0;
-}
 
 matrix* eye(int rows, int cols) {
     matrix *M = init_matrix(rows, cols);
@@ -140,142 +94,238 @@ matrix* transpose(const matrix *M) {
     return M_t;
 }
 
-double norm(const matrix *v) {
-    double n = 0.0;
-
-    for (int i = 0; i < v->rows; i++) {
-        double el = v->data[m_index(v, i, 0)];
-        n += el*el;
+mask rand_mask(int rows, int cols) {
+    unsigned char* m = calloc(rows*cols, sizeof(unsigned char));
+    while (getrandom(m, rows*cols*sizeof(unsigned char), 0) < rows*cols*sizeof(bool)) { /* empty */ }
+    for (int i = 0; i < rows*cols; i++) {
+        m[i] = m[i] / 64;
     }
 
-    return sqrt(n);
+    return m;
 }
 
-matrix* sub_matrix(const matrix *M, int i, int j, int k, int l) {
-    if (M == NULL) {
-        return NULL;
-    }
-
-    int rows = j - i + 1;
-    int cols = l - k + 1;
-
-    matrix *M_sub = init_matrix(rows, cols);
-
-    for (int c = 0; c < cols; c++) {
-        for (int r = 0; r < rows; r++) {
-            M_sub->data[m_index(M_sub, r, c)] = M->data[m_index(M, i + r, k + c)];
-        }
-    }
-
-    return M_sub;
-}
-
-void set_sub_matrix(matrix *M, int i, int j, int k, int l, const matrix *M_sub) {
-    if (M == NULL || M_sub == NULL) {
-        return;
-    }
-
-    int rows = j - i + 1;
-    int cols = l - k + 1;
-
-    for (int c = 0; c < cols; c++) {
-        for (int r = 0; r < rows; r++) {
-            M->data[m_index(M, i + r, k + c)] = M_sub->data[m_index(M_sub, r, c)];
+void apply_mask(image_channels chns, mask m) {
+    #pragma omp parallel for
+    for (int j = 0; j < chns.R->cols; j++) {
+        for (int i = 0; i < chns.R->rows; i++) {
+            int index = m_index(chns.R, i, j);
+            if (m[index]) {
+                chns.R->data[index] = 255;
+                chns.G->data[index] = 255;
+                chns.B->data[index] = 255;
+            }
         }
     }
 }
 
-QR* hqr(const matrix *M) {
-    QR* qr = calloc(1, sizeof(QR));
-    if (M == NULL) {
-        qr->Q = NULL;
-        qr->R = NULL;
-        return qr;
+image_channels image_to_channels(image img) {
+    image_channels channels = {.R = init_matrix(img.height, img.width), .G = init_matrix(img.height, img.width), .B = init_matrix(img.height, img.width)};
+    #pragma omp parallel for
+    for (int i = 0; i < img.height; i++) {
+        for (int j = 0; j < img.width; j++) {
+            channels.R->data[m_index(channels.R, i, j)] = (double) img.rows[i][3*j];
+            channels.G->data[m_index(channels.G, i, j)] = (double) img.rows[i][3*j + 1];
+            channels.B->data[m_index(channels.B, i, j)] = (double) img.rows[i][3*j + 2];
+        }
     }
-
-    int n = M->rows;
-    int m = M->cols;
-
-    matrix *Q = eye(n, n);
-    matrix *R = copy_matrix(M);
-
-    qr->Q = Q;
-    qr->R = R;
-
-    for (int j = 0; j < n; j++) {
-        matrix *x = sub_matrix(R, j, n - 1, j, j);
-        double normx = norm(x);
-        double rjj = R->data[m_index(R, j, j)];
-        int s = sign(rjj);
-
-        double ul = rjj - s*normx;
-        matrix *w = copy_matrix(x);
-        scalar_mult(1.0/ul, w);
-        w->data[m_index(w, 0, 0)] = 1.0;
-
-        double tau = -s*ul/normx;
-
-        matrix *R_sub = sub_matrix(R, j, n - 1, 0, m - 1);
-        matrix *w_t = transpose(w);
-        //printf("%i %i %i %i\n", w_t->rows, w_t->cols, R_sub->rows, R_sub->cols);   
-        matrix *w_tTimesR_sub = mult(w_t, R_sub);
-            
-        matrix *R_diff = mult(w, w_tTimesR_sub);
-        scalar_mult(tau, R_diff);
-        sub(R_sub, R_diff);
-        set_sub_matrix(R, j, n - 1, 0, m - 1, R_sub);
-
-        matrix *Q_sub = sub_matrix(Q, 0, n - 1, j, m - 1);
-        matrix *Q_subTimesw = mult(Q_sub, w);
-        matrix *Q_diff = mult(Q_subTimesw, w_t);
-        scalar_mult(tau, Q_diff);
-        sub(Q_sub, Q_diff);
-        set_sub_matrix(Q, 0, n - 1, j, m - 1, Q_sub);
-
-        free_matrix(x);
-        free_matrix(w);
-        free_matrix(R_sub);
-        free_matrix(w_t);
-        free_matrix(w_tTimesR_sub);
-        free_matrix(R_diff);
-        free_matrix(Q_sub);
-        free_matrix(Q_subTimesw);
-        free_matrix(Q_diff);
-    }
-
-    return qr;
+    return channels;
 }
 
+image channels_to_image(image_channels channels) {
+    png_bytepp row_pointers = calloc(channels.R->rows, sizeof(png_bytep));
+    #pragma omp parallel for
+    for (int i = 0; i < channels.R->rows; i++) {
+        row_pointers[i] = calloc(3*channels.R->cols, sizeof(png_byte));
+        for (int j = 0; j < channels.R->cols; j++) {
+            row_pointers[i][3*j] = (png_byte) channels.R->data[m_index(channels.R, i, j)];
+            row_pointers[i][3*j + 1] = (png_byte) channels.G->data[m_index(channels.G, i, j)];
+            row_pointers[i][3*j + 2] = (png_byte) channels.B->data[m_index(channels.B, i, j)];
+        }
+    }
+
+    image img = {.width = channels.R->cols, .height = channels.R->rows, .rows = row_pointers};
+    return img;
+}
+
+matrix* ALS(const matrix* A, const int k) {
+    matrix* W = eye(A->rows, k);
+    matrix* Z = eye(A->cols, k);
+    int jvpt[k];
+    int rank;
+    for (int i = 0; i < 30; i++) {
+        matrix* A_cop = copy_matrix(A);
+        matrix* W_cop = copy_matrix(W);
+        // A = W, X = Z^T, B = A
+        LAPACKE_dgelsy(LAPACK_COL_MAJOR, W_cop->rows, W_cop->cols, A->cols, W_cop->data, W_cop->rows, A_cop->data, A_cop->rows, jvpt, 1.e-8, &rank);
+        free_matrix(W_cop);
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < A->cols; j++) {
+                Z->data[m_index(Z, j, i)] = A_cop->data[m_index(A_cop, i, j)];
+            }
+        }
+        free_matrix(A_cop);
+        matrix* A_cop2 = transpose(A);
+//print_matrix(A_cop2);
+        matrix* Z_cop = copy_matrix(Z);
+        // A = Z, X = W^T, B = A^T
+        LAPACKE_dgelsy(LAPACK_COL_MAJOR, Z_cop->rows, Z_cop->cols, A_cop2->cols, Z_cop->data, Z->rows, A_cop2->data, A_cop2->rows, jvpt, 1.e-8, &rank);
+        //print_matrix(A_cop2);
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < A->rows; j++) {
+                W->data[m_index(W, j, i)] = A_cop2->data[m_index(A_cop2, i, j)];
+            }
+        }
+        free_matrix(A_cop2);
+        free_matrix(Z_cop);
+    }
+ //   print_matrix(W);
+    //print_matrix(W);
+    matrix* approx = init_matrix(A->rows, A->cols);
+    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, W->rows, Z->rows, W->cols, 1.0, W->data, W->rows, Z->data, Z->rows, 0.0, approx->data, A->rows);
+    free_matrix(W);
+    free_matrix(Z);
+    return approx;
+}
+
+matrix* ALS_masked(const matrix* A, mask m, const int k, const double beta, const int iterations) {
+    matrix* W = eye(A->rows, k);
+    matrix* Z = eye(A->cols, k);
+
+    for (int iteration = 0; iteration < iterations; iteration++) {
+        #pragma omp parallel for
+        for (int i = 0; i < A->cols; i++) {
+            int jvpt[k];
+            int rank;
+            int n = 0;
+            for (int j = 0; j < A->rows; j++) {
+                if (!m[m_index(A, j, i)]) {
+                    n++;
+                }
+            }
+            matrix* W_m = init_matrix(2*n, k);
+            matrix* A_m = init_matrix(2*n, 1);
+            n = 0;
+            #pragma omp parallel for
+            for (int j = 0; j < A->rows; j++) {
+                if (!m[m_index(A, j, i)]) {
+                    A_m->data[m_index(A_m, n, 0)] = A->data[m_index(A, j, i)];
+                    for (int c = 0; c < W_m->cols; c++) {
+                        W_m->data[m_index(W_m, n, c)] = W->data[m_index(W, j, c)];
+                    }
+                    n++;
+                }
+            }
+            #pragma omp parallel for
+            for (int r = n; r < 2*n; r++) {
+                for (int j = 0; j < k; j++) {
+                    if ((r-n) == j) {
+                        W_m->data[m_index(W_m, r, j)] = beta;
+                    }
+                }
+            }
+
+            // A = W_m, X = Z_i, B = A_m
+            int info;
+            if ((info = LAPACKE_dgelsy(LAPACK_COL_MAJOR, W_m->rows, W_m->cols, A_m->cols, W_m->data, W_m->rows, A_m->data, A_m->rows, jvpt, 1.e-8, &rank)) != 0) {
+                printf("%i\n", info);
+                exit(info);
+            }
+            for (int j = 0; j < k; j++) {
+                Z->data[m_index(Z, i, j)] = A_m->data[m_index(A_m, j, 0)];
+            }
+            free_matrix(W_m);
+            free_matrix(A_m);
+        }
+        
+        #pragma omp parallel for
+        for (int i = 0; i < A->rows; i++) {
+            int jvpt[k];
+            int rank;
+            int n = 0;
+            for (int j = 0; j < A->cols; j++) {
+                if (!m[m_index(A, i, j)]) {
+                    n++;
+                }
+            }
+            matrix* Z_m = init_matrix(2*n, k);
+            matrix* A_m = init_matrix(2*n, 1);
+            n = 0;
+            #pragma omp parallel for
+            for (int j = 0; j < A->cols; j++) {
+                if (!m[m_index(A, i, j)]) {
+                    A_m->data[m_index(A_m, n, 0)] = A->data[m_index(A, i, j)];
+                    for (int c = 0; c < Z_m->cols; c++) {
+                        Z_m->data[m_index(Z_m, n, c)] = Z->data[m_index(Z, j, c)];
+                    }
+                    n++;
+                }
+            }
+            #pragma omp parallel for
+            for (int r = n; r < 2*n; r++) {
+                for (int j = 0; j < k; j++) {
+                    if ((r - n) == j) {
+                        Z_m->data[m_index(Z_m, r, j)] = beta;
+                    }
+                }
+            }
+
+            // A = Z_m, X = W_i, B = A_m
+            if (LAPACKE_dgelsy(LAPACK_COL_MAJOR, Z_m->rows, Z_m->cols, A_m->cols, Z_m->data, Z_m->rows, A_m->data, A_m->rows, jvpt, 1.e-8, &rank) != 0) {
+                exit(2);
+            }
+            for (int j = 0; j < k; j++) {
+                W->data[m_index(W, i, j)] = A_m->data[m_index(A_m, j, 0)];
+            }
+            free_matrix(Z_m);
+            free_matrix(A_m);
+        }
+    }
+    matrix* approx = init_matrix(A->rows, A->cols);
+    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, W->rows, Z->rows, W->cols, 1.0, W->data, W->rows, Z->data, Z->rows, 0.0, approx->data, A->rows);
+    free_matrix(W);
+    free_matrix(Z);
+    return approx;
+}
+
+#define ARGS 6
 int main(int argc, char** argv) {
-    setbuf(stdout, 0);
-    matrix *B = init_matrix(3, 3);
-    B->data[m_index(B, 0, 0)] = 1;
-    B->data[m_index(B, 1, 0)] = 2;
-    B->data[m_index(B, 2, 0)] = 3;
+    if (argc != ARGS + 1) {
+        printf("Usage: %s SOURCE_IMG RANK BETA ITERATIONS THREADS OUTPUT_IMG\n", argv[0]);
+        return 1;
+    }
+    image img = read_png(argv[1]);
+    write_png(img, "orig.png");
+    int rank = atoi(argv[2]);
+    int iterations = atoi(argv[4]);
+    int threads = atoi(argv[5]);
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
+    double beta = strtod(argv[3], NULL);
 
-    B->data[m_index(B, 0, 1)] = 4;
-    B->data[m_index(B, 1, 1)] = 5;
-    B->data[m_index(B, 2, 1)] = 6;
+    image_channels chns = image_to_channels(img);
+    mask m = rand_mask(chns.R->rows, chns.R->cols);
+    apply_mask(chns, m);
+    image masked_img = channels_to_image(chns);
+    write_png(masked_img, "masked.png");
+    
+    double start = omp_get_wtime();
+    #pragma omp parallel for
+    for (int i = 0; i < 3; i++) {
+        if (i == 0) {
+            chns.R = ALS_masked(chns.R, m, rank, beta, iterations);
+        } else if (i == 1) {
+            chns.G = ALS_masked(chns.G, m, rank, beta, iterations);
+        } else {
+            chns.B = ALS_masked(chns.B, m, rank, beta, iterations);
+        }
+    }
+    double end = omp_get_wtime();
+    printf("Total time: %lfs\n", end - start);
 
-    B->data[m_index(B, 0, 2)] = 7;
-    B->data[m_index(B, 1, 2)] = 8;
-    B->data[m_index(B, 2, 2)] = 9;
+    image new_img = channels_to_image(chns);
+    
 
-    QR *qr = hqr(B);
-    print_matrix(B);
-    matrix *Q_t = transpose(qr->Q);
-    matrix *qrm = mult(qr->Q, Q_t);
-    print_matrix(qrm);
-    print_matrix(qr->R);
-
-    free_matrix(B);
-    free_matrix(qr->Q);
-    free_matrix(qr->R);
-    free(qr);
-    free_matrix(qrm);
-    free_matrix(Q_t);
-   
-
+    write_png(new_img, argv[6]);
    
     return 0;
-}
+}   
