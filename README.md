@@ -5,7 +5,9 @@ This project generates a "noisy" image, and attempts to recover the original usi
 This low-rank approximation is generated via ALS matrix completion. See the report in the file report.pdf for a more technical explanation on the topic.
 
 
+This project depends on libpng, as well as some LAPACKE and CBLAS implementation libraries being installed on your system.
 This project can be compiled with the command `gcc -O3 matrix.c png.c -lpng -llapacke -lcblas -lomp -fopenmp -o image_completion`
+
 
 The program can be run with the following commmand: `./image_completion SOURCE_IMG RANK BETA ITERATIONS THREADS OUTPUT_IMG`
 
